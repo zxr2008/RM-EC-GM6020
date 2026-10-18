@@ -46,11 +46,11 @@ volatile uint8_t  g_fault_flag = 0;
 
 /* 工作模式：0 = 速度跟随正弦；1 = 位置跟随正弦。
    用 J-Link/Ozone 直接写这个变量就能切换曲线，不用重新烧录。 */
-volatile int32_t  g_mode      = 0;
+volatile int32_t  g_mode      = 1;
 
 /* 在线可调参数（用 J-Link/Ozone 直接写） */
-volatile float    g_spd_kp      = 25.0f;
-volatile float    g_spd_ki      = 2.0f;
+volatile float    g_spd_kp      = 14.0f;
+volatile float    g_spd_ki      = 0.5f;
 volatile float    g_spd_kd      = 1.0f;
 volatile float    g_cur_per_rpm = 2.5f;
 volatile float    g_fric_low    = 650.0f;
@@ -100,9 +100,9 @@ constexpr float kFricLow  = 500.0f;
 constexpr float kFricHigh = 60.0f;
 
 /* 速度环 PID（电流模式下整定） */
-constexpr float kSpdKp = 25.0f, kSpdKi = 2.0f, kSpdKd = 1.0f;
+constexpr float kSpdKp = 14.0f, kSpdKi = 0.5f, kSpdKd = 1.0f;
 /* 位置环 P */
-constexpr float kPosKp = 15.0f, kPosKi = 0.0f, kPosKd = 0.0f;
+constexpr float kPosKp = 30.0f, kPosKi = 0.0f, kPosKd = 0.0f;
 
 constexpr uint32_t kCanTimeoutMs = 100;
 
@@ -142,18 +142,30 @@ void SendFrame(void) {
 }
 
 /* ========================================================================= */
-/* 摩擦前馈（按参考 rpm 平滑换向）                                           */
+/* 摩擦前馈（按参考 rpm 平滑换向，只在电机落后时补偿）                       */
 /* ========================================================================= */
-float FrictionFeedforward(float w_ref_rpm) {
+float FrictionFeedforward(float w_ref_rpm, float w_filt_rpm) {
     float dir = w_ref_rpm / 0.5f;          // ±0.5 rpm 过渡带：过零更快给满
     if (dir >  1.0f) dir =  1.0f;
     if (dir < -1.0f) dir = -1.0f;
 
-    float a = std::fabs(w_ref_rpm) / 25.0f;
+    /* 衰减看实测转速：卡住时不管给定多大，静摩擦都按零速给足；
+       真正转起来后前馈再退掉。用给定速度会在“卡住但给定很大”时
+       把前馈错误地衰减掉，导致要等积分慢慢积累才能冲开。 */
+    float a = std::fabs(w_filt_rpm) / 25.0f;
     if (a > 1.0f) a = 1.0f;
 
     const float mag = g_fric_low - (g_fric_low - g_fric_high) * a;
-    return mag * dir;
+    float out = mag * dir;
+
+    /* 只补偿“电机还没跟上给定”的情况。若实测速度已经超过给定（同方向
+       冲过头），摩擦前馈立即退掉，否则它会继续推着电机过冲，PID 的
+       反向制动力被抵消，低转速下就会反复粘滑/抖动。 */
+    const float lag = (w_ref_rpm - w_filt_rpm) *
+                      (w_ref_rpm >= 0.0f ? 1.0f : -1.0f);
+    if (lag <= 0.0f) return 0.0f;
+    if (lag < 0.5f) return out * (lag / 0.5f);
+    return out;
 }
 
 /* ========================================================================= */
@@ -220,7 +232,7 @@ void RunControl(void) {
                     (static_cast<float>(g_motor.velRpm()) - g_w_filt);
 
         u = g_cur_per_rpm * w_ref
-          + FrictionFeedforward(w_ref)
+          + FrictionFeedforward(w_ref, g_w_filt)
           + g_spd_pid.calc(w_ref, g_w_filt);
 
         g_vel_ref = w_ref;
@@ -250,7 +262,7 @@ void RunControl(void) {
                     (static_cast<float>(g_motor.velRpm()) - g_w_filt);
 
         u = g_cur_per_rpm * w_ref_rpm
-          + FrictionFeedforward(w_ref_rpm)
+          + FrictionFeedforward(w_ref_rpm, g_w_filt)
           + g_spd_pid.calc(w_ref_rpm, g_w_filt);
 
         g_pos_ref = th_ref - g_theta0;
