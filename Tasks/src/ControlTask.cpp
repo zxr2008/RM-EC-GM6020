@@ -1,270 +1,337 @@
 /**
- * ControlTask.cpp
- * ------------------------------------------------------------------
- * GM6020 正弦跟随 + 看门狗保护
- *
- * 结构（从上到下就是执行顺序）：
- *   1. 参数区      —— 所有能调的数字都集中在这里
- *   2. 发送函数    —— 把电压变成 8 字节 CAN 帧发出去
- *   3. 初始化      —— 打开 CAN、发两帧 0、启动 1 kHz 心跳
- *   4. 主任务      —— 每 1 ms 跑一次的全部控制逻辑
- *   5. 接收        —— 收到电机反馈时拆字节
- *   6. 中断回调    —— 把 HAL 的中断接到上面几个函数
- *
- * 数据流（每 1 毫秒循环一次）：
- *   正弦发生器 → 参考值 → 位置环(可选) → 速度环 → 电压 → CAN → 电机
- *        ↑                                                    │
- *        └──────────────── 电机反馈 ←──────────────────────────┘
- * ------------------------------------------------------------------
- */
+  ******************************************************************************
+  * @file    ControlTask.cpp
+  * @brief
+  *
+  *   - TIM6 1 kHz：速度环 / 位置环
+  *   - 速度给定 ±100 rpm、0.2 Hz；位置给定 ±60°、0.1 Hz
+  *   - 电机为电流模式：发 0x1FE 电流帧（16384 ≈ 3 A）
+  *   - 速度环：速度前馈 Kff·ω_ref + 摩擦前馈 + PID，输出限幅 ±3000
+  *   - 反馈用电机回传 rpm，经一阶低通 α=0.012（约 83 ms）
+  *   - 掉线 100 ms 输出清零并复位 PID
+  ******************************************************************************
+  */
+
 #include "ControlTask.h"
 #include "Gm6020.h"
 #include "Pid.h"
 #include "main.h"
 
-#include <math.h>
+#include <cmath>
+#include <cstdint>
 
-/* hcan1 / htim6 / hiwdg 是 CubeMX 在 main.c 里定义的全局句柄 */
+/* hcan1 / htim6 / hiwdg 由 CubeMX 在 main.c / can.c / tim.c / iwdg.c 中定义 */
 extern "C" {
 extern CAN_HandleTypeDef  hcan1;
 extern TIM_HandleTypeDef  htim6;
 extern IWDG_HandleTypeDef hiwdg;
 }
 
-/* ==================================================================
- * 1. 参数区：现场只改这里
- * ================================================================== */
+/* ------------------------------------------------------------------------- */
+/* 给 Ozone 观察的全局量（速度单位 rpm，位置单位 rad）                       */
+/* ------------------------------------------------------------------------- */
+extern "C" {
+volatile float    g_pos_ref   = 0.0f;   /* rad，相对进入位置模式时的角度 */
+volatile float    g_pos_fdb   = 0.0f;
+volatile float    g_pos_ref_deg = 0.0f; /* deg，Ozone 直接看角度制 */
+volatile float    g_pos_fdb_deg = 0.0f;
+volatile float    g_vel_ref   = 0.0f;   /* rpm */
+volatile float    g_vel_fdb   = 0.0f;   /* rpm，低通后 */
+volatile float    g_vel_cmd   = 0.0f;   /* 速度环给定（rpm） */
+volatile float    g_volt      = 0.0f;   /* 输出电流给定 */
+volatile float    g_temp      = 0.0f;
+volatile uint32_t g_loop_cnt  = 0;
+volatile uint32_t g_rx_cnt    = 0;
+volatile uint8_t  g_fault_flag = 0;
+
+/* 工作模式：0 = 速度跟随正弦；1 = 位置跟随正弦。
+   用 J-Link/Ozone 直接写这个变量就能切换曲线，不用重新烧录。 */
+volatile int32_t  g_mode      = 0;
+
+/* 在线可调参数（用 J-Link/Ozone 直接写） */
+volatile float    g_spd_kp      = 25.0f;
+volatile float    g_spd_ki      = 2.0f;
+volatile float    g_spd_kd      = 1.0f;
+volatile float    g_cur_per_rpm = 2.5f;
+volatile float    g_fric_low    = 650.0f;
+volatile float    g_fric_high   = 60.0f;
+volatile float    g_fdb_alpha   = 0.012f;
+volatile float    g_out_limit   = 3000.0f;
+}
+
 namespace {
 
-/* ---------- 1.1 电机与工作模式 ---------- */
-constexpr uint8_t kMotorId = 1;   // 必须和电机外壳上的拨码开关一致
-constexpr int     kMode    = 0;   // 0 = 速度跟随正弦；1 = 位置跟随正弦
+constexpr float kPi       = 3.14159265359f;
+constexpr float kTwoPi    = 6.28318530718f;
+constexpr float kRadToRpm = 60.0f / kTwoPi;
+constexpr float kRadToDeg = 180.0f / kPi;
 
-/* ---------- 1.2 正弦参考 ---------- */
-constexpr float kFreqHz = 0.2f;   // 0.2 Hz → 5 秒一个周期（肉眼看得清）
-constexpr float kPosAmp = 0.6f;   // 位置幅值 ±0.6 rad ≈ ±34°
-constexpr float kVelAmp = 1.5f;   // 速度幅值 ±1.5 rad/s ≈ ±14 rpm
+/* ========================================================================= */
+/* 参数区                                                                    */
+/* ========================================================================= */
+namespace cfg {
 
-/* ---------- 1.3 限幅与保护 ---------- */
-constexpr float kVelRefMax = 3.0f;    // 位置环输出（速度目标）的限幅
-constexpr float kVoltMax   = 2000.0f; // 输出电压限幅；满量程 25000 ≈ 24 V
-                                      // 2000 ≈ 1.9 V ≈ 空载 26 rpm，第一次上电够安全
-constexpr float kVelFdbMax = 35.0f;   // 超速保护阈值 rad/s
-constexpr float kTempMax   = 70.0f;   // 过温保护阈值 ℃
-constexpr uint16_t kLostMax = 100;    // 掉线保护：连续多少毫秒没反馈就锁死
+constexpr uint8_t kMotorId = 1;          // GM6020 拨码 ID
+constexpr float   kLoopDt  = 0.001f;     // TIM6 1 kHz
 
-constexpr float kPi = 3.14159265358979f;
-constexpr float kFF = 1.0f;           // 位置模式的速度前馈系数
+/* 速度正弦：±100 rpm，0.2 Hz */
+constexpr float kSpdAmpRpm = 100.0f;
+constexpr float kSpdFreqHz = 0.2f;
 
-/* ---------- 1.4 对象 ---------- */
-Gm6020 g_motor(kMotorId);
+/* 位置正弦：±60°，0.1 Hz */
+constexpr float kPosAmpDeg  = 60.0f;
+constexpr float kPosFreqHz  = 0.1f;
+constexpr float kPosSpdLimit = 20.0f;    // 位置环输出限幅 rad/s
 
-/* 位置环：输入角度误差(rad)，输出速度目标(rad/s)
- * 只给 P，因为速度环已经提供了阻尼，位置环再加 D 容易抖 */
-Pid g_pos_pid(5.0f, 0.0f, 0.0f, kVelRefMax, -kVelRefMax);
+constexpr float kRampInSec = 1.5f;       // 起振渐变
 
-/* 速度环：输入速度误差(rad/s)，输出电压给定
- * Kp 1200 / Ki 6000 是仿真调出来的：纯 P 跟不上正弦，必须靠 I 顶；
- * 而 Kp 又不能太大，因为转速反馈量化单位是 1 rpm，Kp 太大会被量化噪声放大成抖动 */
-Pid g_vel_pid(1200.0f, 6000.0f, 0.0f, kVoltMax, -kVoltMax);
+/* 电流模式：0x1FE（16384 ≈ 3 A） */
+constexpr bool  kCurrentMode = true;
+constexpr float kOutLimit    = 3000.0f;  // 输出限幅（≈0.55 A）
 
-bool g_fault = false;   // 故障锁存：一旦置位只有断电重启才清除
+/* 速度前馈：每 rpm 给多少电流 */
+constexpr float kCurPerRpm = 2.5f;
 
-/* ==================================================================
- * 2. 发送函数：把当前电压打成 8 字节发出去
- * ================================================================== */
-void sendVoltageFrame(void) {
+/* 速度反馈一阶低通 α（≈83 ms） */
+constexpr float kFdbAlpha = 0.012f;
+
+/* 摩擦前馈：零速 650，高速 60，|ω_ref| ≥ 25 rpm 后保持 60 */
+constexpr float kFricLow  = 500.0f;
+constexpr float kFricHigh = 60.0f;
+
+/* 速度环 PID（电流模式下整定） */
+constexpr float kSpdKp = 25.0f, kSpdKi = 2.0f, kSpdKd = 1.0f;
+/* 位置环 P */
+constexpr float kPosKp = 15.0f, kPosKi = 0.0f, kPosKd = 0.0f;
+
+constexpr uint32_t kCanTimeoutMs = 100;
+
+} // namespace cfg
+
+/* ========================================================================= */
+/* 对象与状态                                                                */
+/* ========================================================================= */
+Gm6020 g_motor(cfg::kMotorId);
+Pid    g_spd_pid(cfg::kSpdKp, cfg::kSpdKi, cfg::kSpdKd, cfg::kOutLimit, -cfg::kOutLimit);
+Pid    g_pos_pid(cfg::kPosKp, cfg::kPosKi, cfg::kPosKd, cfg::kPosSpdLimit, -cfg::kPosSpdLimit);
+
+float    g_t          = 0.0f;
+float    g_theta0     = 0.0f;
+float    g_w_filt     = 0.0f;
+bool     g_pos_init   = false;
+bool     g_motor_seen = false;
+uint32_t g_last_rx_ms = 0;
+
+/* ========================================================================= */
+/* CAN 发送                                                                  */
+/* ========================================================================= */
+void SendFrame(void) {
+    if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) == 0) return;
+
     CAN_TxHeaderTypeDef hdr = {0};
-    uint8_t data[8] = {0};      // 8 个格子先全填 0，占住位置
+    hdr.StdId = g_motor.txId();
+    hdr.IDE   = CAN_ID_STD;
+    hdr.RTR   = CAN_RTR_DATA;
+    hdr.DLC   = 8;
 
-    hdr.StdId = g_motor.txId(); // ID1~4 → 0x1FF，ID5~7 → 0x2FF
-    hdr.IDE   = CAN_ID_STD;     // 标准帧（11 位 ID）
-    hdr.RTR   = CAN_RTR_DATA;   // 数据帧
-    hdr.DLC   = 8;              // 带 8 字节
+    uint8_t data[8] = {0};
+    g_motor.encode(data);
 
-    g_motor.encode(data);       // 把电压写进自己那两个字节
-
-    /* STM32 只有 3 个发送邮箱，总线异常时会占满。
-       先检查再发，避免 HAL_CAN_AddTxMessage 卡住整个 1 kHz 循环 */
-    if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) > 0) {
-        uint32_t mailbox = 0;
-        HAL_CAN_AddTxMessage(&hcan1, &hdr, data, &mailbox);
-    }
+    uint32_t mailbox = 0;
+    (void)HAL_CAN_AddTxMessage(&hcan1, &hdr, data, &mailbox);
 }
 
-}  // namespace
+/* ========================================================================= */
+/* 摩擦前馈（按参考 rpm 平滑换向）                                           */
+/* ========================================================================= */
+float FrictionFeedforward(float w_ref_rpm) {
+    float dir = w_ref_rpm / 0.5f;          // ±0.5 rpm 过渡带：过零更快给满
+    if (dir >  1.0f) dir =  1.0f;
+    if (dir < -1.0f) dir = -1.0f;
 
-/* ==================================================================
- * 2.5 给调试器观察的全局变量
- * ------------------------------------------------------------------
- * volatile 的作用：告诉编译器"这个变量可能被外部（调试器/中断）读取"，
- * 不许优化掉、不许缓存到寄存器。否则 Release 编译时它们会被整段删掉，
- * 你在 Ozone / gdb 里就看不到任何东西。
- * ================================================================== */
-extern "C" {
-volatile float    g_pos_ref   = 0.0f;   // 位置给定
-volatile float    g_pos_fdb   = 0.0f;   // 位置反馈
-volatile float    g_vel_ref   = 0.0f;   // 速度给定
-volatile float    g_vel_fdb   = 0.0f;   // 速度反馈
-volatile float    g_vel_cmd   = 0.0f;   // 位置环输出（速度指令）
-volatile float    g_volt      = 0.0f;   // 最终电压给定
-volatile float    g_temp      = 0.0f;   // 电机温度
-volatile uint32_t g_loop_cnt  = 0;      // 控制循环跑了多少次（判断 1 kHz 是否正常）
-volatile uint32_t g_rx_cnt    = 0;      // 收到多少帧反馈（判断通信是否正常）
-volatile uint8_t  g_fault_flag = 0;     // 1 = 保护已触发并锁存
+    float a = std::fabs(w_ref_rpm) / 25.0f;
+    if (a > 1.0f) a = 1.0f;
+
+    const float mag = g_fric_low - (g_fric_low - g_fric_high) * a;
+    return mag * dir;
 }
 
-/* ==================================================================
- * 3. 上电初始化：只执行一次
- * ================================================================== */
-extern "C" void ControlTaskInit(void) {
-    /* ---------- 3.1 配置 CAN 过滤器 ---------- */
-    CAN_FilterTypeDef filter = {0};
-    filter.FilterBank           = 0;                     // 用 0 号过滤器组
-    filter.FilterMode           = CAN_FILTERMODE_IDMASK;  // 掩码模式
-    filter.FilterScale          = CAN_FILTERSCALE_32BIT;
-    filter.FilterIdHigh         = 0x0000;
-    filter.FilterIdLow          = 0x0000;
-    filter.FilterMaskIdHigh     = 0x0000;   // 掩码全 0 = 不筛选，所有帧都收
-    filter.FilterMaskIdLow      = 0x0000;
-    filter.FilterFIFOAssignment = CAN_RX_FIFO0;           // 收到的帧进 FIFO0
-    filter.FilterActivation     = ENABLE;
-    filter.SlaveStartFilterBank = 14;       // CAN2 用 14~27，这里给 CAN1 让路
-
-    HAL_CAN_ConfigFilter(&hcan1, &filter);
-    HAL_CAN_Start(&hcan1);
-    HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
-
-    /* ---------- 3.2 上电先发两帧 0 电压 ----------
-       防止驱动器里残留上一轮的指令，让电机一上电就自己动 */
-    g_motor.setVoltage(0);
-    sendVoltageFrame();
-    HAL_Delay(20);              // 此刻 TIM6 还没启动，用阻塞延时是安全的
-    sendVoltageFrame();
-
-    /* ---------- 3.3 启动 1 kHz 心跳 ----------
-       这一行是"开机键"：没有它，MainTask 永远不会被调用 */
-    HAL_TIM_Base_Start_IT(&htim6);
-
-    /* ---------- 3.4 第一次喂狗 ---------- */
-    HAL_IWDG_Refresh(&hiwdg);
-}
-
-/* ==================================================================
- * 4. 主任务：TIM6 每 1 ms 调用一次
- * ================================================================== */
-extern "C" void MainTask(void) {
-    /* ---------- 4.1 时间累加 ----------
-       static：只初始化一次，函数返回后值仍保留，下一拍接着累加。
-       每拍进 1 ms，所以 +0.001 秒。 */
-    static float t = 0.0f;
-    t += 0.001f;
-    if (t > 1000.0f) t -= 1000.0f;    // 防止跑很久之后浮点精度变差
-
-    const float omega = 2.0f * kPi * kFreqHz;   // 角频率 ω = 2πf
-
-    /* ---------- 4.2 生成正弦参考 ---------- */
-    const float pos_ref    = kPosAmp * sinf(omega * t);
-    const float pos_vel_ff = kPosAmp * omega * cosf(omega * t);  // 位置参考的导数
-
-    /* 速度模式用 sinf 而不是 cosf：sin(0)=0，上电从 0 速平滑起步，
-       用 cosf 的话 t=0 就是最大速度，等于上来给一个阶跃。 */
-    const float vel_ref = (kMode == 0) ? (kVelAmp * sinf(omega * t))
-                                       : pos_vel_ff;
-
-    /* ---------- 4.3 读反馈 ---------- */
-    const float pos_fdb = g_motor.angle();
-    const float vel_fdb = g_motor.vel();
-    const float temp    = g_motor.temp();
-
-    /* ---------- 4.4 位置环（仅位置模式） ---------- */
-    float vel_cmd;
-    if (kMode == 0) {
-        vel_cmd = vel_ref;                        // 速度模式：直接给速度目标
-    } else {
-        vel_cmd = g_pos_pid.calc(pos_ref, pos_fdb)  // 角度误差 → 速度目标
-                + kFF * pos_vel_ff;                 // 前馈：补掉 PID 天生的滞后
-        if (vel_cmd >  kVelRefMax) vel_cmd =  kVelRefMax;
-        if (vel_cmd < -kVelRefMax) vel_cmd = -kVelRefMax;
+/* ========================================================================= */
+/* 1 kHz 控制                                                                */
+/* ========================================================================= */
+void RunControl(void) {
+    /* 在线参数生效 */
+    static float last_kp = -1.0f, last_ki = -1.0f, last_kd = -1.0f, last_lim = -1.0f;
+    if (g_spd_kp != last_kp || g_spd_ki != last_ki || g_spd_kd != last_kd) {
+        g_spd_pid.setParams(g_spd_kp, g_spd_ki, g_spd_kd);
+        last_kp = g_spd_kp; last_ki = g_spd_ki; last_kd = g_spd_kd;
+    }
+    if (g_out_limit != last_lim) {
+        g_spd_pid.setOutputLimit(g_out_limit, -g_out_limit);
+        last_lim = g_out_limit;
     }
 
-    /* ---------- 4.5 速度环 ---------- */
-    float volt = g_vel_pid.calc(vel_cmd, vel_fdb);
+    const uint32_t now    = HAL_GetTick();
+    const bool     online = g_motor_seen &&
+                            ((now - g_last_rx_ms) < cfg::kCanTimeoutMs);
 
-    /* ---------- 4.6 三重保护 ----------
-       1) 超速   2) 过温   3) 掉线（连续 100 ms 没有新反馈） */
-    static uint32_t last_rx = 0;
-    static uint16_t lost_ms = 0;
+    g_temp = g_motor.temp();
 
-    if (g_rx_cnt == last_rx) {          // 这一拍没收到新帧
-        if (lost_ms < 1000) lost_ms++;  // 计数器封顶，避免溢出
-    } else {
-        last_rx = g_rx_cnt;
-        lost_ms = 0;
-    }
-
-    if (fabsf(vel_fdb) > kVelFdbMax || temp > kTempMax || lost_ms > kLostMax) {
-        g_fault = true;
-    }
-
-    if (g_fault) {
-        volt = 0.0f;            // 锁死输出
-        g_vel_pid.reset();      // 清积分，避免解除后猛冲
+    if (!online) {
+        g_spd_pid.reset();
         g_pos_pid.reset();
+        g_motor.setVoltage(0);
+        g_pos_ref = 0.0f;
+        g_pos_fdb = 0.0f;
+        g_pos_ref_deg = 0.0f;
+        g_pos_fdb_deg = 0.0f;
+        g_vel_ref = 0.0f;
+        g_vel_fdb = 0.0f;
+        g_vel_cmd = 0.0f;
+        g_volt    = 0.0f;
+        g_fault_flag = 1;
+        return;
+    }
+    g_fault_flag = 0;
+
+    /* 模式切换：复位时间/滤波/PID，位置模式重新取当前角度为中心，
+       让位置/速度正弦都从零相位、1.5 s 起振重新开始。 */
+    static int32_t last_mode = -1;
+    if (g_mode != last_mode) {
+        g_t        = 0.0f;
+        g_w_filt   = 0.0f;
+        g_pos_init = false;
+        g_spd_pid.reset();
+        g_pos_pid.reset();
+        last_mode  = g_mode;
     }
 
-    /* ---------- 4.7 下发 ---------- */
-    g_motor.setVoltage(static_cast<int16_t>(volt));
-    sendVoltageFrame();
+    const float ramp = (g_t < cfg::kRampInSec) ? (g_t / cfg::kRampInSec) : 1.0f;
+    float u = 0.0f;
 
-    /* ---------- 4.8 给调试器看的观测量 ----------
-       volatile：防止编译器优化掉（否则 Release 下这些变量会被删） */
-    g_pos_ref     = pos_ref;
-    g_pos_fdb     = pos_fdb;
-    g_vel_ref     = (kMode == 0) ? vel_ref : vel_cmd;
-    g_vel_fdb     = vel_fdb;
-    g_vel_cmd     = vel_cmd;
-    g_volt        = volt;
-    g_temp        = temp;
-    g_fault_flag  = g_fault ? 1 : 0;
-    g_loop_cnt = g_loop_cnt + 1;   // 显式写法，避免 volatile 自增的编译警告
+    if (g_mode == 0) {
+        /* ---------- 速度环：给定 rpm 正弦 ---------- */
+        g_t += cfg::kLoopDt;
+        const float w_ref = cfg::kSpdAmpRpm * ramp *
+                            std::sin(kTwoPi * cfg::kSpdFreqHz * g_t);
 
-    /* ---------- 4.9 喂狗 ----------
-       放在最后一行：只有整段逻辑正常跑完才喂。
-       如果程序卡死或跑飞，这一行执行不到，0.8 秒后看门狗复位。 */
+        /* 反馈：电机内置 rpm + 一阶低通 */
+        g_w_filt += g_fdb_alpha *
+                    (static_cast<float>(g_motor.velRpm()) - g_w_filt);
+
+        u = g_cur_per_rpm * w_ref
+          + FrictionFeedforward(w_ref)
+          + g_spd_pid.calc(w_ref, g_w_filt);
+
+        g_vel_ref = w_ref;
+        g_vel_fdb = g_w_filt;
+        g_vel_cmd = w_ref;
+    } else {
+        /* ---------- 位置环：给定 rad 正弦 ---------- */
+        if (!g_pos_init) {
+            g_theta0   = g_motor.angle();
+            g_pos_init = true;
+        }
+        g_t += cfg::kLoopDt;
+
+        const float w_sin = kTwoPi * cfg::kPosFreqHz;
+        const float amp   = cfg::kPosAmpDeg * kPi / 180.0f;
+        const float th_ref = g_theta0 + amp * ramp * std::sin(w_sin * g_t);
+        const float th_fb  = g_motor.angle();
+
+        float w_ref = amp * w_sin * std::cos(w_sin * g_t)
+                    + g_pos_pid.calc(th_ref, th_fb);
+        if (w_ref >  cfg::kPosSpdLimit) w_ref =  cfg::kPosSpdLimit;
+        if (w_ref < -cfg::kPosSpdLimit) w_ref = -cfg::kPosSpdLimit;
+
+        const float w_ref_rpm = w_ref * kRadToRpm;
+
+        g_w_filt += g_fdb_alpha *
+                    (static_cast<float>(g_motor.velRpm()) - g_w_filt);
+
+        u = g_cur_per_rpm * w_ref_rpm
+          + FrictionFeedforward(w_ref_rpm)
+          + g_spd_pid.calc(w_ref_rpm, g_w_filt);
+
+        g_pos_ref = th_ref - g_theta0;
+        g_pos_fdb = th_fb  - g_theta0;
+        g_pos_ref_deg = g_pos_ref * kRadToDeg;
+        g_pos_fdb_deg = g_pos_fdb * kRadToDeg;
+        g_vel_ref = w_ref_rpm;
+        g_vel_fdb = g_w_filt;
+        g_vel_cmd = w_ref_rpm;
+    }
+
+    if (u >  g_out_limit) u =  g_out_limit;
+    if (u < -g_out_limit) u = -g_out_limit;
+
+    g_motor.setVoltage(static_cast<int16_t>(u));
+    g_volt = u;
+}
+
+} // namespace
+
+/* ========================================================================= */
+/* 对外接口                                                                  */
+/* ========================================================================= */
+extern "C" void ControlTaskInit(void) {
+    /* 调试暂停时不让看门狗复位 */
+    __HAL_DBGMCU_FREEZE_IWDG();
+
+    /* 本工程只用 CAN1；关掉没用到的串口中断，避免抢占 1 kHz 任务 */
+    HAL_NVIC_DisableIRQ(USART3_IRQn);
+    HAL_NVIC_DisableIRQ(USART6_IRQn);
+
+    /* 电流模式：发 0x1FE */
+    g_motor.setCurrentMode(cfg::kCurrentMode);
+
+    /* 电机未上电时总线没有 ACK，开启自动退出 bus-off */
+    hcan1.Init.AutoBusOff = ENABLE;
+    if (HAL_CAN_Init(&hcan1) != HAL_OK) Error_Handler();
+
+    CAN_FilterTypeDef f = {0};
+    f.FilterBank           = 0;
+    f.FilterMode           = CAN_FILTERMODE_IDMASK;
+    f.FilterScale          = CAN_FILTERSCALE_32BIT;
+    f.FilterIdHigh         = 0x0000;
+    f.FilterIdLow          = 0x0000;
+    f.FilterMaskIdHigh     = 0x0000;
+    f.FilterMaskIdLow      = 0x0000;
+    f.FilterFIFOAssignment = CAN_RX_FIFO0;
+    f.FilterActivation     = ENABLE;
+    f.SlaveStartFilterBank = 14;
+    if (HAL_CAN_ConfigFilter(&hcan1, &f) != HAL_OK) Error_Handler();
+
+    if (HAL_CAN_Start(&hcan1) != HAL_OK) Error_Handler();
+    if (HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK) {
+        Error_Handler();
+    }
+
+    /* 上电先发两帧 0，防止驱动器残留旧指令 */
+    g_motor.setVoltage(0);
+    SendFrame();
+    HAL_Delay(20);
+    SendFrame();
+
+    g_last_rx_ms = HAL_GetTick();
+    if (HAL_TIM_Base_Start_IT(&htim6) != HAL_OK) Error_Handler();
     HAL_IWDG_Refresh(&hiwdg);
 }
 
-/* ==================================================================
- * 5. 收到一帧反馈
- * ================================================================== */
+extern "C" void MainTask(void) {
+    g_loop_cnt = g_loop_cnt + 1u;
+    RunControl();
+    SendFrame();
+    HAL_IWDG_Refresh(&hiwdg);
+}
+
 extern "C" void CanFeedbackCallback(uint32_t std_id, const uint8_t *data) {
-    if (std_id == g_motor.rxId()) {   // 0x204 + ID，只认自己那台
-        g_motor.decode(data);         // 8 字节 → 角度/转速/电流/温度
-        g_rx_cnt = g_rx_cnt + 1;      // 掉线保护靠它判断"还在不在收数据"
-    }
+    if (std_id != g_motor.rxId()) return;
+    g_motor.decode(data);
+    g_last_rx_ms = HAL_GetTick();
+    g_motor_seen = true;
+    g_rx_cnt = g_rx_cnt + 1u;
 }
 
-/* ==================================================================
- * 6. HAL 弱函数重写：把中断接到上面的函数
- * ================================================================== */
-
-/* TIM6 更新中断 → 1 kHz 主任务 */
-extern "C" void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-    if (htim->Instance == TIM6) {
-        MainTask();
-    }
-}
-
-/* CAN1 收到一帧 → 取出数据 → 交给 CanFeedbackCallback */
-extern "C" void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
-    if (hcan->Instance != CAN1) return;
-
-    CAN_RxHeaderTypeDef hdr;
-    uint8_t data[8];
-    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &hdr, data) != HAL_OK) return;
-
-    if (hdr.IDE == CAN_ID_STD) {          // 只处理标准帧
-        CanFeedbackCallback(hdr.StdId, data);
-    }
-}
+/* 说明：HAL_TIM_PeriodElapsedCallback / HAL_CAN_RxFifo0MsgPendingCallback
+   已经实现在 Core/Src/stm32f4xx_it.c，这里不再重复定义。 */

@@ -22,6 +22,7 @@
 #include "stm32f4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "ControlTask.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -333,5 +334,47 @@ void USART6_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
+
+/**
+  * @brief TIM6 周期中断回调 —— 1 kHz 控制节拍
+  * ------------------------------------------------------------------
+  * 这是整个作业的"心跳"：MainTask() 只在被调用时才会跑控制环、
+  * 发 CAN 指令、并在最后一行喂看门狗。
+  * 如果这里漏接，MainTask 不会被任何代码引用，链接器会把它当死代码
+  * 裁掉（符号表里找不到 MainTask），同时看门狗 0.8 s 后复位板子。
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance == TIM6) {
+    MainTask();
+  }
+}
+
+/**
+  * @brief CAN1 FIFO0 收到报文回调 —— 取走 GM6020 反馈帧
+  * ------------------------------------------------------------------
+  * 必须在这里把报文读出来：不读的话 FIFO 会一直挂着 pending 标志，
+  * 中断会不停重入，而且 decode() 永远拿不到角度/转速。
+  * 一次中断里尽量排空 FIFO，防止 1 kHz 反馈把 FIFO 挤爆溢出。
+  */
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+{
+  if (hcan->Instance != CAN1) {
+    return;
+  }
+
+  CAN_RxHeaderTypeDef rx_hdr;
+  uint8_t             rx_data[8];
+
+  /* 最多排空 4 帧，留个上限避免异常时把这个中断变成死循环 */
+  for (int i = 0; i < 4; ++i) {
+    if (HAL_CAN_GetRxFifoFillLevel(hcan, CAN_RX_FIFO0) == 0) {
+      break;
+    }
+    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_hdr, rx_data) == HAL_OK) {
+      CanFeedbackCallback(rx_hdr.StdId, rx_data);
+    }
+  }
+}
 
 /* USER CODE END 1 */
