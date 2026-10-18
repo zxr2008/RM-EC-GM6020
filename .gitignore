@@ -43,3 +43,7 @@ CubeMX中文图解.md
 *.pdf
 C_board_src/
 CMakeLists.template.txt
+
+# ---- 个人调参工具（仅本地使用，不属于作业交付）----
+plot.bat
+tools/
