@@ -23,7 +23,23 @@ build/
 参考实现/
 练习/
 
+# ---- pyOCD 采样输出（曲线图与数据）----
+curve_*
+
 # ---- 操作系统垃圾文件 ----
 Thumbs.db
 .DS_Store
 desktop.ini
+
+# ---- 个人学习资料（仅本地保存，不提交仓库）----
+教程_GM6020正弦跟随.md
+CubeMX中文图解.md
+现场作业单.md
+代码讲解与工作流程.md
+代码清单与解读.md
+仿真调参.html
+
+# ---- 队伍下发的参考资料（原始压缩包里已有）----
+*.pdf
+C_board_src/
+CMakeLists.template.txt
