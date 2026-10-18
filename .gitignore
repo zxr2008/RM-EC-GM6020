@@ -47,3 +47,8 @@ CMakeLists.template.txt
 # ---- 个人调参工具（仅本地使用，不属于作业交付）----
 plot.bat
 tools/
+
+# ---- 个人使用、不提交 ----
+README.md
+build.bat
+flash_cboard.bat
